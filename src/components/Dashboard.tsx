@@ -3,6 +3,8 @@
 import { useSession, signIn, signOut } from 'next-auth/react';
 import { useState, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
+import { Toaster } from "@/components/ui/sonner"
+import { toast } from "sonner"
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
@@ -145,8 +147,9 @@ export default function Dashboard() {
             const updated = await res.json();
             setVideo({ ...video, snippet: updated.snippet });
             setIsEditing(false);
+            toast.success('Video updated successfully!');
         } catch (e) {
-            alert('Failed to update video. Ensure you have the right permissions.');
+            toast.error('Failed to update video. Ensure you have the right permissions.');
         } finally {
             setIsSavingVideo(false);
         }
@@ -175,7 +178,8 @@ export default function Dashboard() {
             });
             setNewNote('');
             fetchNotes(video.id);
-        } catch (e) { alert('Failed to save note'); }
+            toast.success('Note added!');
+        } catch (e) { toast.error('Failed to save note'); }
     }
 
     async function deleteNote(id: string) {
@@ -183,7 +187,8 @@ export default function Dashboard() {
         try {
             await fetcher(`/api/notes/${id}`, { method: 'DELETE' });
             fetchNotes(video.id);
-        } catch (e) { alert('Failed to delete note'); }
+            toast.success('Note deleted');
+        } catch (e) { toast.error('Failed to delete note'); }
     }
 
     // --- AI Suggestions ---
@@ -197,7 +202,8 @@ export default function Dashboard() {
                 body: JSON.stringify({ title: video.snippet.title, description: video.snippet.description })
             });
             setAiSuggestions(data.suggestions);
-        } catch (e) { alert('AI Request Failed'); }
+            toast.success('AI Suggestions generated!');
+        } catch (e) { toast.error('AI Request Failed'); }
         finally { setIsGeneratingAI(false); }
     }
 
@@ -266,10 +272,11 @@ export default function Dashboard() {
                     })
                 }
             );
-            // Re-fetch to normalize ID and data
-            setTimeout(() => fetchComments(video.id), 2000);
+            // Re-fetch to normalize ID and data. YouTube API is slow (eventual consistency), so we wait longer.
+            setTimeout(() => fetchComments(video.id), 10000);
+            toast.success('Comment posted!');
         } catch (e) {
-            alert('Failed to post comment');
+            toast.error('Failed to post comment');
             setComments(current => current.filter(c => c.id !== tempId)); // Rollback
         }
     }
@@ -277,6 +284,34 @@ export default function Dashboard() {
     async function replyToComment(parentId: string) {
         const text = replyText[parentId];
         if (!text?.trim() || !session?.accessToken) return;
+
+        // Optimistic Reply
+        const tempId = Date.now().toString();
+        const optimisticReply = {
+            id: tempId,
+            snippet: {
+                textDisplay: text,
+                authorDisplayName: session.user?.name || 'You',
+                authorProfileImageUrl: session.user?.image || '',
+                publishedAt: new Date().toISOString()
+            }
+        };
+
+        const updatedComments = comments.map(c => {
+            if (c.id === parentId) {
+                return {
+                    ...c,
+                    replies: {
+                        comments: [...(c.replies?.comments || []), optimisticReply]
+                    }
+                };
+            }
+            return c;
+        });
+        setComments(updatedComments);
+        setReplyText({ ...replyText, [parentId]: '' });
+        setActiveReplyId(null);
+
         try {
             await fetch(
                 `https://www.googleapis.com/youtube/v3/comments?part=snippet`,
@@ -294,14 +329,63 @@ export default function Dashboard() {
                     })
                 }
             );
-            setReplyText({ ...replyText, [parentId]: '' });
-            setActiveReplyId(null);
-            alert('Reply posted!');
-        } catch (e) { alert('Failed to reply'); }
+            setTimeout(() => fetchComments(video.id), 10000);
+            toast.success('Reply posted!');
+        } catch (e) {
+            toast.error('Failed to reply');
+            fetchComments(video.id); // Revert/Reload
+        }
     }
+
+    // --- My Videos & History ---
+    const [myVideos, setMyVideos] = useState<any[]>([]);
+    const [historyVideos, setHistoryVideos] = useState<any[]>([]);
+
+    async function fetchMyVideos() {
+        if (!session?.accessToken) return;
+        try {
+            // 1. Fetch Uploads (Search method for simplicity)
+            const res = await fetch(
+                `https://www.googleapis.com/youtube/v3/search?part=snippet&forMine=true&type=video&maxResults=10&order=date`,
+                { headers: { Authorization: `Bearer ${session.accessToken}` } }
+            );
+            const data = await res.json();
+            setMyVideos(data.items || []);
+
+            // 2. Fetch History (Videos with Notes)
+            const notesRes = await fetcher<Note[]>('/api/notes?limit=10'); // Need to update API to support distinct videos or just map client side
+            // For now, let's just stick to "My Videos" and maybe generic "Recent" from local storage if needed.
+            // Actually, let's use the Notes API to find unique Video IDs the user has worked on.
+            // Simplified: Just showing 'My Videos' covers the user's need to "select from them".
+        } catch (e) { console.error('Fetch videos error', e); }
+    }
+
+    useEffect(() => {
+        if (session) fetchMyVideos();
+    }, [session]);
+
 
     async function deleteComment(commentId: string) {
         if (!confirm('Delete this comment?') || !session?.accessToken) return;
+
+        // Optimistic Delete (Top Level)
+        const previousComments = [...comments];
+        setComments(current => current.map(c => {
+            // Check if it's a top level delete
+            if (c.snippet.topLevelComment.id === commentId) return null;
+
+            // Check if it's a replay delete
+            if (c.replies?.comments) {
+                return {
+                    ...c,
+                    replies: {
+                        comments: c.replies.comments.filter(r => r.id !== commentId)
+                    }
+                };
+            }
+            return c;
+        }).filter(Boolean) as any[]);
+
         try {
             await fetch(
                 `https://www.googleapis.com/youtube/v3/comments?id=${commentId}`,
@@ -310,9 +394,13 @@ export default function Dashboard() {
                     headers: { Authorization: `Bearer ${session.accessToken}` }
                 }
             );
-            // Optimistic update or refetch
-            fetchComments(video.id);
-        } catch (e) { alert('Failed to delete comment'); }
+            // Sync with YouTube after delay
+            setTimeout(() => fetchComments(video.id), 10000);
+            toast.success('Comment deleted');
+        } catch (e) {
+            toast.error('Failed to delete comment');
+            setComments(previousComments); // Rollback
+        }
     }
 
 
@@ -339,22 +427,49 @@ export default function Dashboard() {
             </div>
 
             {/* Video Selector */}
+            {/* Video Selector & My Videos */}
             {!video && (
-                <Card>
-                    <CardHeader><CardTitle>Load Video</CardTitle></CardHeader>
-                    <CardContent className="flex gap-4">
-                        <Input
-                            placeholder="Enter YouTube Video ID (e.g., dQw4w9WgXcQ)"
-                            value={videoId}
-                            onChange={(e) => setVideoId(e.target.value)}
-                        />
-                        <Button onClick={() => fetchVideoDetails()} disabled={isLoading}>
-                            {isLoading ? <Loader2 className="animate-spin mr-2" /> : null}
-                            Load
-                        </Button>
-                    </CardContent>
-                    {error && <div className="text-red-500 px-6 pb-4">{error}</div>}
-                </Card>
+                <div className="space-y-8">
+                    <Card>
+                        <CardHeader><CardTitle>Load Video</CardTitle></CardHeader>
+                        <CardContent className="flex gap-4">
+                            <Input
+                                placeholder="Enter YouTube Video ID or URL"
+                                value={videoId}
+                                onChange={(e) => setVideoId(e.target.value)}
+                            />
+                            <Button onClick={() => fetchVideoDetails()} disabled={isLoading}>
+                                {isLoading ? <Loader2 className="animate-spin mr-2" /> : null}
+                                Load
+                            </Button>
+                        </CardContent>
+                        {error && <div className="text-red-500 px-6 pb-4">{error}</div>}
+                    </Card>
+
+                    {/* My Videos Grid */}
+                    {myVideos.length > 0 && (
+                        <div>
+                            <h2 className="text-xl font-bold mb-4">My Recent Uploads</h2>
+                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                {myVideos.map(item => (
+                                    <Card key={item.id.videoId} className="cursor-pointer hover:shadow-md transition-shadow" onClick={() => fetchVideoDetails(item.id.videoId)}>
+                                        <CardContent className="p-4 flex gap-4">
+                                            <img
+                                                src={item.snippet.thumbnails.default.url}
+                                                alt="Thumb"
+                                                className="w-24 h-18 object-cover rounded"
+                                            />
+                                            <div className="overflow-hidden">
+                                                <h3 className="font-semibold truncate">{item.snippet.title}</h3>
+                                                <p className="text-xs text-gray-500">{new Date(item.snippet.publishedAt).toLocaleDateString()}</p>
+                                            </div>
+                                        </CardContent>
+                                    </Card>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
             )}
 
             {/* Main Content */}
@@ -463,7 +578,7 @@ export default function Dashboard() {
                                                         className="opacity-0 group-hover:opacity-100 transition-opacity"
                                                         onClick={() => {
                                                             setEditTitle(suggestion);
-                                                            alert('Copied to "Manage Video" tab!');
+                                                            toast.success('Copied to "Manage Video" tab!');
                                                         }}
                                                     >
                                                         Use
@@ -582,11 +697,32 @@ export default function Dashboard() {
                                                                 {thread.replies?.comments && (
                                                                     <div className="ml-4 mt-2 space-y-3 pl-4 border-l-2">
                                                                         {thread.replies.comments.map(reply => (
-                                                                            <div key={reply.id} className="flex gap-2 bg-white p-2 rounded">
-                                                                                <img src={reply.snippet.authorProfileImageUrl} className="w-6 h-6 rounded-full" />
-                                                                                <div>
-                                                                                    <div className="text-xs font-bold">{reply.snippet.authorDisplayName}</div>
-                                                                                    <div className="text-xs">{reply.snippet.textDisplay}</div>
+                                                                            <div key={reply.id} className="flex flex-col gap-1 bg-white p-2 rounded">
+                                                                                <div className="flex gap-2">
+                                                                                    <img src={reply.snippet.authorProfileImageUrl} className="w-6 h-6 rounded-full" />
+                                                                                    <div>
+                                                                                        <div className="text-xs font-bold">{reply.snippet.authorDisplayName}</div>
+                                                                                        <div className="text-xs">{reply.snippet.textDisplay}</div>
+                                                                                    </div>
+                                                                                </div>
+                                                                                <div className="flex gap-2 pl-8">
+                                                                                    <Button
+                                                                                        variant="ghost" size="sm"
+                                                                                        className="h-6 text-[10px] text-blue-600 px-1"
+                                                                                        onClick={() => {
+                                                                                            setActiveReplyId(thread.id);
+                                                                                            setReplyText(prev => ({ ...prev, [thread.id]: `@${reply.snippet.authorDisplayName} ` }));
+                                                                                        }}
+                                                                                    >
+                                                                                        Reply
+                                                                                    </Button>
+                                                                                    <Button
+                                                                                        variant="ghost" size="sm"
+                                                                                        className="h-6 text-[10px] text-red-500 hover:text-red-700 px-1"
+                                                                                        onClick={() => deleteComment(reply.id)}
+                                                                                    >
+                                                                                        Delete
+                                                                                    </Button>
                                                                                 </div>
                                                                             </div>
                                                                         ))}
