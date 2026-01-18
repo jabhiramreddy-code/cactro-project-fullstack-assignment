@@ -7,7 +7,7 @@ import { logEvent } from '@/lib/logger';
 
 export async function PUT(
     request: Request,
-    { params }: { params: { id: string } }
+    { params }: { params: Promise<{ id: string }> } // Fix: Promise
 ) {
     try {
         const session = await getServerSession(authOptions);
@@ -15,7 +15,7 @@ export async function PUT(
             return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
         }
 
-        const { id } = params;
+        const { id } = await params;
         const body = await request.json();
         const { content, tags } = body;
 
@@ -43,7 +43,7 @@ export async function PUT(
 
 export async function DELETE(
     request: Request,
-    { params }: { params: { id: string } }
+    { params }: { params: Promise<{ id: string }> } // Fix: Promise
 ) {
     try {
         const session = await getServerSession(authOptions);
@@ -51,7 +51,7 @@ export async function DELETE(
             return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
         }
 
-        const { id } = params;
+        const { id } = await params;
 
         await dbConnect();
         const note = await Note.findByIdAndDelete(id);
